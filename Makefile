@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-O3 -Wall -Wextra -Wpedantic -std=c99
+CFLAGS=-O3 -Wall -Wextra -Wpedantic -std=c99 -flto
 
 all: bin/index bin/start bin/move bin/end
 
@@ -10,7 +10,7 @@ bin/start: start.c | bin/
 	$(CC) $(CFLAGS) $^ -o $@
 
 bin/move: move.c jsonw.c jsonw.h | bin/
-	$(CC) $(CFLAGS) -Wno-parentheses -Wno-unused-value -Wno-sign-compare \
+	$(CC) $(CFLAGS) -Wno-parentheses -Wno-unused-value \
 		move.c jsonw.c -o $@
 
 bin/end: end.c | bin/
