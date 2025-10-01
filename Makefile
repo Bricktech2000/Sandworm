@@ -9,8 +9,8 @@ bin/index: index.c | bin/
 bin/start: start.c | bin/
 	$(CC) $(CFLAGS) $^ -o $@
 
-bin/move: move.c jsonw.c jsonw.h | bin/
-	$(CC) $(CFLAGS) -Wno-parentheses -Wno-unused-value \
+bin/move: move.c jsonw.c jsonw.h tictac.h | bin/
+	$(CC) $(CFLAGS) -march=native -Wno-parentheses -Wno-unused-value \
 		move.c jsonw.c -o $@
 
 bin/end: end.c | bin/

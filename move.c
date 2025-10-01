@@ -1,203 +1,287 @@
 #include "jsonw.h"
 #include "tictac.h"
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+// XXX multithreading?
+// XXX Best Reply Search? https://notpeerreviewed.com/blog/battlesnake/
+// XXX run Jack's snake and compare search depth
+
 // write diagnostics to `stderr` so cgi.conf can redirect them to a file
+
+#define MAX_DEPTH 64 // for allocating a buffer for iterative deepening
+#define MAX_SNAKES 4 // for allocating buffers to store snakes
+#define T_CUTOFF 200 // cutoff to deepening the search, in milliseconds
+#define N_PROPS 32   // number of propagation steps in Voronoi
+#define K_OWNED 1    // reward for "owned" cells in Voronoi
+#define K_LENGTH 2   // reward for snake's length
+#define K_HEALTH 0   // reward for snake's health
 
 #define TICTAC_STREAM stderr
 
-#define OUT_PARAM(TYPE, IDENT)                                                 \
+#if defined(UINT128_MAX) // standard `uint128_t` is (probably) supported
+#
+#elif defined(__SIZEOF_INT128__) // `__uint128_t` GCC extension
+#define uint128_t __uint128_t
+#define UINT128_MAX ((uint128_t) - 1)
+#else // expect user to provide definitions
+#error "provide definitions for `uint128_t` and `UINT128_MAX`"
+#endif
+
+#define OUT_PARAM(TYPE, IDENT) /* taken verbatim from jsonw.c */               \
   TYPE _out_param_##IDENT;                                                     \
   if (IDENT == NULL)                                                           \
   IDENT = &_out_param_##IDENT
 
-char *jsonw_short(short *num, char *json) {
-  OUT_PARAM(short, num);
+char *jsonw_uchar(unsigned char *num, char *json) {
+  OUT_PARAM(unsigned char, num);
   double dbl;
-  if ((json = jsonw_number(&dbl, json)) && dbl < SHRT_MAX && (short)dbl == dbl)
-    return *num = (short)dbl, json;
+  if ((json = jsonw_number(&dbl, json)) && dbl >= 0 && dbl <= UCHAR_MAX &&
+      (unsigned char)dbl == dbl)
+    return *num = (unsigned char)dbl, json;
   return NULL;
 }
 
-#define MIN_SEARCH 0.175 // seconds. determined experimentally
-#define K_LENGTH 16.0    // reward for length
-#define K_HEALTH 0.0     // reward for health
-#define K_OTHERS 4.0     // reward for screwing others
+typedef uint128_t bb_t; // bit board
 
-#define BUFFER 2 // number of `WALL` tiles to buffer the edge of the playfield
+int bb_popcnt(bb_t bb) {
+  // codegens into a pair of `popcnt` instructions
+  int pop = 0;
+  for (; bb; pop++)
+    bb &= bb - 1;
+  return pop;
+}
 
-// TODO:
-// - [x] make all snakes move at the same time.
-// - [x] put our snake at index 0 instead of using `game.you`
-// - [x] add food & health to our game model
-// - [x] add snake length to our game model
-// - [x] add snakes dying to game model
-// - [x] make a BOARD(X, Y) macro to query the board
-// - [x] don't store `snakes` in `game`, rather make it a param
-//       of `minimax`; this way, only need to revert `board`
-// - [x] why do we keep dying in head-to-heads?
-// - [x] stop committing suicide; assume imperfect opponent
-
-enum { WALL = -3, FOOD = -2, EMPTY = -1 };
-
-#define AT(BOARD, Y, X)                                                        \
-  BOARD.cells[(Y + BUFFER) * (BOARD.w + 2 * BUFFER) + (X + BUFFER)]
+bb_t bb_dump(bb_t bb) {
+  fprintf(stderr, "%016" PRIxLEAST64 "%016" PRIxLEAST64 "\n",
+          (uint_least64_t)(bb >> 64), (uint_least64_t)(bb & (bb_t)-1 >> 64));
+  return bb;
+}
 
 struct snake {
-  short length;
-  unsigned char health;
+  // making the head and tail `unsigned char`s doesn't improve performance and
+  // complicates the code
+  bb_t head, tail;
+  bb_t axis, sign;
+  unsigned char length, health;
   unsigned char taillag; // number of turns to wait before moving the tail
-  short hx, hy, tx, ty;
 };
 
 struct board {
-  // width and height of the actual playfield, excludes the `BUFFER`
-  short w, h;
-  // when `cell` is not one of `WALL, FOOD, EMPTY`, `cell >> 2` is the index of
-  // the snake in the cell and `cell & 3` is the direction toward the head
-  signed char *cells;
+  struct snake snakes[MAX_SNAKES];
+  bb_t food, bodies, heads; // XXX doc `heads` just for this turn
+  bb_t board, xmask;        // XXX doc these
+  unsigned char width, height;
 };
 
-int boardeval(struct board board, struct snake snakes[8]) {
-  if (!(*snakes).health)
-    return INT_MIN;
+short evaluate(struct board *board) {
+  if (!board->snakes->health)
+    return 0;
 
-  int eval = 0;
+  // use 's' to index into `board->snakes` and 'l' to index into `sort`
 
-  for (int s = 0; s < 8; s++) {
-    if (!snakes[s].health)
-      continue;
+  // caching this sorting doesn't improve performance
+  int n = 0;
+  unsigned char sort[MAX_SNAKES]; // snake indices sorted by decreasing length
+  for (int s = 0; s < MAX_SNAKES; s++)
+    if (board->snakes[s].health)
+      sort[n++] = s;
+  for (int temp, hi = n; hi--;)
+    for (int l = 0; l < hi; l++)
+      if (board->snakes[sort[l]].length < board->snakes[sort[l + 1]].length)
+        temp = sort[l], sort[l] = sort[l + 1], sort[l + 1] = temp;
 
-    // TODO use floodfill instead:
-    // memcpy board.
-    // sort snakes by len.
-    // for sorted snakes:
-    //   fill cardinals around head.
-    // for 0 to 5:
-    //   for each empty/food cell:
-    //     if next to filled, fill with snake of max len.
+  // Voronoi heuristic
 
-    // TODO rewrite everything to bitboards
+  bb_t filled = board->bodies;
 
-    int e = 0;
-    // XXX this check is expensive
-#define ISFREE(V)                                                              \
-  (V == FOOD || V == EMPTY || V != WALL && !snakes[V >> 2].health)
-#define E(DY, DX) ISFREE(AT(board, snakes[s].hy DY, snakes[s].hx DX))
+  bb_t owned[MAX_SNAKES];
+  for (int l = 0; l < n; l++)
+    owned[l] = board->snakes[sort[l]].head;
 
-    // don't exceed `BUFFER`, with these deltas!
+  for (int i = 0; i < N_PROPS; i++) {
+    for (int l = 0; l < n; l++) {
+      bb_t adjacent = 0;
+      adjacent |= (owned[l] & board->xmask) >> 1;
+      adjacent |= owned[l] << 1 & board->xmask;
+      adjacent |= owned[l] >> board->width;
+      adjacent |= owned[l] << board->width & board->board;
 
-    e += E(-1, -1) + E(-1, +0) + E(-1, +1);
-    e += E(+0, -1) + E(+0, +0) + E(+0, +1);
-    e += E(+1, -1) + E(+1, +0) + E(+1, +1);
-
-    e += E(-2, -2) + E(-2, -1) + E(-2, +0) + E(-2, +1) + E(-2, +2);
-    e += E(-1, -2) + E(-1, -1) + E(-1, +0) + E(-1, +1) + E(-1, +2);
-    e += E(+0, -2) + E(+0, -1) + E(+0, +0) + E(+0, +1) + E(+0, +2);
-    e += E(+1, -2) + E(+1, -1) + E(+1, +1) + E(+1, +1) + E(+1, +2);
-    e += E(+2, -2) + E(+2, -1) + E(+2, +2) + E(+2, +1) + E(+2, +2);
-
-    // for (short dy = -BUFFER; dy <= BUFFER; dy++) {
-    //   for (short dx = -BUFFER; dx <= BUFFER; dx++) {
-    //     signed char v = AT(board, snakes[s].hy + dy, snakes[s].hx + dx);
-    //     e += v == FOOD || v == EMPTY || v != WALL && !snakes[v >> 2].health;
-    //   }
-    // }
-
-    e += snakes[s].length * K_LENGTH;
-    e += snakes[s].health * K_HEALTH;
-    eval += s ? -e * K_OTHERS : e;
+      owned[l] |= adjacent & ~filled;
+      filled |= adjacent;
+    }
   }
 
-  return (unsigned)eval << 2;
+  // XXX computing `owned[]` for all snakes but only using the one corresponding
+  // to the "you" snake. keeping it in, because in the future we may need to
+  // sort opponent moves based on how good they are for them
+  for (int l = 0; l < n; l++)
+    if (sort[l] == 0)
+      return bb_popcnt(owned[l]) * K_OWNED + board->snakes->length * K_LENGTH +
+             board->snakes->health * K_HEALTH;
+
+  abort();
+}
+
+short minimax(struct board *board, short (*evals)[4], short alpha, short beta,
+              int depth);
+short minimax_step(int s, struct board *board, short (*evals)[4], short alpha,
+                   short beta, int depth) {
+  if (depth == 0)
+    return evaluate(board);
+
+  if (!board->snakes->health)
+    return 0; // prevent infinite loop below
+  do
+    if (++s == MAX_SNAKES)
+      return minimax(board, evals, alpha, beta, depth);
+  while (!board->snakes[s].health);
+
+  struct snake *snake = board->snakes + s;
+
+  // shifting right by 1 to leave some buffer to avoid wraparound
+  short eval = s ? SHRT_MAX >> 1 : 0;
+  unsigned char length = snake->length, health = snake->health;
+  unsigned char taillag = snake->taillag;
+
+  board->heads &= ~snake->head;
+
+  // XXX bug: if a snake has no possible moves, we stop recursing
+  for (int i = 0; i < 4; i++) {
+    short *evalp = *evals;
+    for (short *e = *evals; e < *evals + 4; e++)
+      if (*evalp < 0 || *e >= 0 && *e > *evalp == !s)
+        evalp = e;
+
+    bool axis = (evalp - *evals) >> 1, sign = (evalp - *evals) & 1;
+
+    if (!axis && !sign && !(snake->head & board->xmask) ||
+        !axis && sign && !(snake->head << 1 & board->xmask) ||
+        axis && !sign && !(snake->head >> board->width) ||
+        axis && sign && !(snake->head << board->width & board->board))
+      goto contin;
+
+    axis ? (snake->axis |= snake->head) : (snake->axis &= ~snake->head);
+    sign ? (snake->sign |= snake->head) : (snake->sign &= ~snake->head);
+    sign ? (snake->head <<= axis ? board->width : 1)
+         : (snake->head >>= axis ? board->width : 1);
+
+    if (snake->head & board->bodies)
+      goto abort;
+
+    // XXX code dup with `evaluate`
+    bb_t adjacent = 0;
+    adjacent |= (snake->head & board->xmask) >> 1;
+    adjacent |= snake->head << 1 & board->xmask;
+    adjacent |= snake->head >> board->width;
+    adjacent |= snake->head << board->width & board->board;
+
+    // XXX doc. quiescence search? can't actually make a move if it's next to
+    // the head of a weakly longer snake that hasn't yet moved this turn
+    if (adjacent & board->heads)
+      for (int r = s + 1; r < MAX_SNAKES; r++)
+        if (board->snakes[r].length >= snake->length &&
+            board->snakes[r].health && (adjacent & board->snakes[r].head))
+          goto abort;
+
+    board->bodies |= snake->head;
+    snake->health--;
+    if (snake->taillag)
+      snake->taillag--;
+    if (snake->head & board->food)
+      snake->length++, snake->taillag++, snake->health = 100;
+
+    *evalp = minimax_step(s, board, evals + 1, alpha, beta, depth - 1);
+    ++*evalp; // XXX doc prefer committing suicide later
+
+    if (!s && *evalp > eval)
+      eval = *evalp, alpha = eval > alpha ? eval : alpha;
+    // XXX comment; make sure still a problem
+    // the `+1` is to assume an imperfect opponent. without it, when we're in
+    // a situation where an optimal opponent could technically screw us
+    // regardless of whan we do, we'd commit suicide
+    if (s && *evalp < eval)
+      eval = ++*evalp, beta = eval < beta ? eval : beta;
+
+    snake->length = length, snake->health = health;
+    snake->taillag = taillag;
+    board->bodies &= ~snake->head;
+
+  abort:
+    sign ? (snake->head >>= axis ? board->width : 1)
+         : (snake->head <<= axis ? board->width : 1);
+
+    // when minimax is hopelessly broken and commenting out these two lines
+    // fixes it, it's likely there's an eval overflowing somewhere
+    if (alpha >= beta)
+      break;
+
+  contin:
+    *evalp = ~*evalp;
+  }
+
+  for (short *e = *evals; e < *evals + 4; e++)
+    *e = *e < 0 ? ~*e : *e;
+
+  board->heads |= snake->head;
+
+  return eval;
 }
 
 // XXX pay closer attention to ABI?
+short minimax(struct board *board, short (*evals)[4], short alpha, short beta,
+              int depth) {
+#if MAX_SNAKES <= 8
+  uint_fast8_t
+#elif MAX_SNAKES <= 16
+  uint_fast16_t
+#elif MAX_SNAKES <= 32
+  uint_fast32_t
+#elif MAX_SNAKES <= 64
+  uint_fast64_t
+#endif
+      axes = 0,
+      sgns = 0;
 
-// `minimax(...) >> 2` is the actual eval, and `minimax(...) & 3` is the
-// direction that led to that eval
-int minimax(struct board board, struct snake snakes[8], int s, int alpha,
-            int beta, int depth) {
-  if (depth == 0)
-    return boardeval(board, snakes);
+  board->heads = 0;
 
-  if (!(*snakes).health)
-    return INT_MIN; // prevent infinite loop below
-  while (!snakes[s++, s %= 8].health)
-    ;
-  struct snake orig = snakes[s];
+  for (int s = 0; s < MAX_SNAKES; s++) {
+    struct snake *snake = board->snakes + s;
 
-  int eval = s ? INT_MAX : INT_MIN;
+    if (!snake->health)
+      continue;
 
-  // TODO sort dirs based on previous runs so we get better pruning
-  for (int dir = 0; dir < 4; dir++) {
-    snakes[s].health--;
+    board->heads |= snake->head;
 
-    AT(board, snakes[s].hy, snakes[s].hx) = s << 2 | dir;
-    snakes[s].hx += (dir == 0) - (dir == 2);
-    snakes[s].hy += (dir == 1) - (dir == 3);
-    signed char hv = AT(board, snakes[s].hy, snakes[s].hx);
-    signed char tv = AT(board, snakes[s].ty, snakes[s].tx);
-    if (snakes[s].taillag)
-      snakes[s].taillag--;
-    else {
-      // before erasing our tail, make sure no other snake put their head there
-      if (tv >> 2 == s)
-        AT(board, snakes[s].ty, snakes[s].tx) = EMPTY;
-      int dir = tv & 3;
-      snakes[s].tx += (dir == 0) - (dir == 2);
-      snakes[s].ty += (dir == 1) - (dir == 3);
-    }
+    if (snake->taillag)
+      continue;
 
-    int o = hv >> 2; // index of the snake where we're walking over, if any
-    unsigned char o_health = snakes[o].health;
-    // if wall, die
-    if (hv == WALL)
-      snakes[s].health = 0;
-    // if food or empty or dead snake's body, ok
-    else if (hv == FOOD || hv == EMPTY || !snakes[o].health)
-      ;
-    // if tail of a snake that hasn't yet moved in this turn, ok
-    else if (o > s && !snakes[o].taillag && snakes[o].tx == snakes[s].hx &&
-             snakes[o].ty == snakes[s].hy)
-      ;
-    // if head of a shorter snake that's already moved in this turn, kill it, ok
-    else if (o < s && snakes[o].length <= snakes[s].length &&
-             snakes[o].hx == snakes[s].hx && snakes[o].hy == snakes[s].hy)
-      snakes[o].health = 0; // health saved in `hv_health` to be restored later
-    // otherwise, die
-    else
-      snakes[s].health = 0;
+    board->bodies &= ~snake->tail;
+    axes <<= 1, sgns <<= 1;
+    axes |= !!(snake->axis & snake->tail);
+    sgns |= !!(snake->sign & snake->tail);
+    sgns & 1 ? (snake->tail <<= axes & 1 ? board->width : 1)
+             : (snake->tail >>= axes & 1 ? board->width : 1);
+  }
 
-    if (snakes[s].health)
-      AT(board, snakes[s].hy, snakes[s].hx) = s << 2;
+  short eval = minimax_step(-1, board, evals, alpha, beta, depth);
 
-    if (hv == FOOD)
-      snakes[s].length++, snakes[s].taillag++, snakes[s].health = 100;
+  for (int s = MAX_SNAKES; s--;) {
+    struct snake *snake = board->snakes + s;
 
-    // the bit fiddling is to stuff into the eval value the direction we took
-    int mm = minimax(board, snakes, s, alpha, beta, depth - 1) & ~3 | dir;
-    if (!s && mm > eval)
-      eval = mm, alpha = eval > alpha ? eval : alpha;
-    // the `+8` is to assume am imperfect opponent. without it, when we're in a
-    // situation where an optimal opponent could technically screw us regardless
-    // of whan we do, we'd commit suicide
-    if (s && mm < eval)
-      eval = mm + 8, beta = eval < beta ? eval : beta;
+    if (!snake->health || snake->taillag)
+      continue;
 
-    // recursive call done; restore everything
-    AT(board, orig.ty, orig.tx) = tv;
-    AT(board, snakes[s].hy, snakes[s].hx) = hv;
-    snakes[o].health = o_health;
-    snakes[s] = orig;
-
-    // alpha--beta pruning
-    if (alpha >= beta)
-      break;
+    sgns & 1 ? (snake->tail >>= axes & 1 ? board->width : 1)
+             : (snake->tail <<= axes & 1 ? board->width : 1);
+    axes & 1 ? (snake->axis |= snake->tail) : (snake->axis &= ~snake->tail);
+    sgns & 1 ? (snake->sign |= snake->tail) : (snake->sign &= ~snake->tail);
+    axes >>= 1, sgns >>= 1;
+    board->bodies |= snake->tail;
   }
 
   return eval;
@@ -209,47 +293,54 @@ int main(void) {
   if (ferror(stdin))
     perror("fread"), exit(EXIT_FAILURE);
   if (!feof(stdin))
-    fputs("buffer exhausted\n", stderr), exit(EXIT_FAILURE);
+    fputs("request buffer exhausted\n", stderr), exit(EXIT_FAILURE);
   req[size] = '\0';
 
-  TIC(parse);
+  // XXX shout
+  // printf("Status: 200 OK\nContent-Type: application/json\n\n");
+  // printf("{\"move\":\"right\",\"shout\":\"foobar\"}\n");
+  // fprintf(stderr, "%s\n", req);
+  // return 0;
+
   // see example-move.json
+  TIC(parse);
 
   char *j_yid = jsonw_lookup(
       "id", jsonw_beginobj(jsonw_lookup("you", jsonw_beginobj(req))));
   char *j_yid_end = jsonw_string(NULL, j_yid);
   if (!j_yid_end)
-    fputs("bad you\n", stderr), exit(EXIT_FAILURE);
+    fputs("bad you id\n", stderr), exit(EXIT_FAILURE);
   ptrdiff_t j_yid_sz = j_yid_end - j_yid;
 
-  struct board board;
+  struct board board = {0};
 
   char *j_board = jsonw_lookup("board", jsonw_beginobj(req));
-  if (!jsonw_short(&board.w, jsonw_lookup("width", jsonw_beginobj(j_board))))
-    fputs("bad width\n", stderr), exit(EXIT_FAILURE);
-  if (!jsonw_short(&board.h, jsonw_lookup("height", jsonw_beginobj(j_board))))
-    fputs("bad height\n", stderr), exit(EXIT_FAILURE);
+  if (!jsonw_uchar(&board.width,
+                   jsonw_lookup("width", jsonw_beginobj(j_board))))
+    fputs("bad board width\n", stderr), exit(EXIT_FAILURE);
+  if (!jsonw_uchar(&board.height,
+                   jsonw_lookup("height", jsonw_beginobj(j_board))))
+    fputs("bad board height\n", stderr), exit(EXIT_FAILURE);
+  if (board.width * board.height > 128)
+    fputs("board too large\n", stderr), exit(EXIT_FAILURE);
 
-  board.cells = malloc((board.w + 2 * BUFFER) * (board.h + 2 * BUFFER));
-  memset(board.cells, WALL, (board.w + 2 * BUFFER) * (board.h + 2 * BUFFER));
-  for (short y = 0; y < board.h; y++)
-    for (short x = 0; x < board.w; x++)
-      AT(board, y, x) = EMPTY;
-
-  struct snake snakes[8] = {0};
+  board.board = ((bb_t)1 << board.width * board.height) - 1;
+  for (unsigned char y = 0; y < board.height; y++)
+    board.xmask <<= board.width, board.xmask |= 1;
+  board.xmask = board.board & ~board.xmask;
 
   char *j_food = jsonw_lookup("food", jsonw_beginobj(j_board));
   for (char *j_point = jsonw_beginarr(j_food); j_point;
        j_point = jsonw_element(j_point)) {
-    short x, y;
-    if (!jsonw_short(&x, jsonw_lookup("x", jsonw_beginobj(j_point))))
-      fputs("bad x\n", stderr), exit(EXIT_FAILURE);
-    if (!jsonw_short(&y, jsonw_lookup("y", jsonw_beginobj(j_point))))
-      fputs("bad y\n", stderr), exit(EXIT_FAILURE);
-    if (x < 0 || x > board.w || y < 0 || y > board.h)
-      fputs("bad point\n", stderr), exit(EXIT_FAILURE);
+    unsigned char x, y;
+    if (!jsonw_uchar(&x, jsonw_lookup("x", jsonw_beginobj(j_point))))
+      fputs("bad food x\n", stderr), exit(EXIT_FAILURE);
+    if (!jsonw_uchar(&y, jsonw_lookup("y", jsonw_beginobj(j_point))))
+      fputs("bad food y\n", stderr), exit(EXIT_FAILURE);
+    if (x > board.width || y > board.height)
+      fputs("bad food point\n", stderr), exit(EXIT_FAILURE);
 
-    AT(board, y, x) = FOOD;
+    board.food |= (bb_t)1 << x + y * board.width;
   }
 
   int s = 1;
@@ -260,74 +351,91 @@ int main(void) {
     char *j_id = jsonw_lookup("id", jsonw_beginobj(j_snake));
     char *j_id_end = jsonw_string(NULL, j_id);
     if (!j_id_end)
-      fputs("bad id\n", stderr), exit(EXIT_FAILURE);
+      fputs("bad snake id\n", stderr), exit(EXIT_FAILURE);
     ptrdiff_t j_id_sz = j_id_end - j_id;
 
     bool is_you = j_yid_sz == j_id_sz && memcmp(j_yid, j_id, j_yid_sz) == 0;
     // XXX bounds check
-    struct snake *snake = is_you ? snakes : snakes + s++;
+    struct snake *snake = is_you ? board.snakes : board.snakes + s++;
+    if (s > MAX_SNAKES)
+      fputs("too many snakes\n", stderr), exit(EXIT_FAILURE);
 
-    (*snake).hx = -1, (*snake).hy = -1;
-    (*snake).tx = -1, (*snake).ty = -1;
+    if (!jsonw_uchar(&snake->length,
+                     jsonw_lookup("length", jsonw_beginobj(j_snake))))
+      fputs("bad snake length\n", stderr), exit(EXIT_FAILURE);
+    if (!jsonw_uchar(&snake->health,
+                     jsonw_lookup("health", jsonw_beginobj(j_snake))))
+      fputs("bad snake health\n", stderr), exit(EXIT_FAILURE);
 
-    short length, health;
-    if (!jsonw_short(&length, jsonw_lookup("length", jsonw_beginobj(j_snake))))
-      fputs("bad length\n", stderr), exit(EXIT_FAILURE);
-    if (!jsonw_short(&health, jsonw_lookup("health", jsonw_beginobj(j_snake))))
-      fputs("bad health\n", stderr), exit(EXIT_FAILURE);
-    (*snake).length = length, (*snake).health = health;
+    signed char hx = -1, hy = -1, tx = -1, ty = -1;
 
     char *j_body = jsonw_lookup("body", jsonw_beginobj(j_snake));
     for (char *j_point = jsonw_beginarr(j_body); j_point;
          j_point = jsonw_element(j_point)) {
-      short x, y;
-      if (!jsonw_short(&x, jsonw_lookup("x", jsonw_beginobj(j_point))))
-        fputs("bad x\n", stderr), exit(EXIT_FAILURE);
-      if (!jsonw_short(&y, jsonw_lookup("y", jsonw_beginobj(j_point))))
-        fputs("bad y\n", stderr), exit(EXIT_FAILURE);
-      if (x < 0 || x > board.w || y < 0 || y > board.h)
-        fputs("bad point\n", stderr), exit(EXIT_FAILURE);
+      unsigned char x, y;
+      if (!jsonw_uchar(&x, jsonw_lookup("x", jsonw_beginobj(j_point))))
+        fputs("bad body x\n", stderr), exit(EXIT_FAILURE);
+      if (!jsonw_uchar(&y, jsonw_lookup("y", jsonw_beginobj(j_point))))
+        fputs("bad body y\n", stderr), exit(EXIT_FAILURE);
+      if (x > board.width || y > board.height)
+        fputs("bad body point\n", stderr), exit(EXIT_FAILURE);
 
-      short dx = (*snake).tx - x, dy = (*snake).ty - y;
-      int dir = 0 * (dx == 1) + 1 * (dy == 1) + 2 * (dx == -1) + 3 * (dy == -1);
+      signed char dx = tx - x, dy = ty - y;
 
-      if ((*snake).hx == -1 && (*snake).hy == -1)
-        (*snake).hx = x, (*snake).hy = y, dir = 0;
-      if ((*snake).tx == x && (*snake).ty == y)
+      if (hx == -1 && hy == -1)
+        hx = x, hy = y;
+      if (tx == x && ty == y)
         // several body parts stacked on top of eachother represents tail lag
-        (*snake).taillag++;
-      (*snake).tx = x, (*snake).ty = y;
+        snake->taillag++;
+      tx = x, ty = y;
 
-      AT(board, y, x) = (snake - snakes) << 2 | dir;
+      // XXX doc
+      // - X axis is 0, Y axis is 1
+      // - - sign is 0, + sign is 1
+      // XXX aka
+      // - "one" axis is 0, "width" axis is 1
+      // - "left shift" sign is 1, "right shift" sign is 0
+      snake->axis |= (bb_t)(dy != 0) << x + y * board.width;
+      snake->sign |= (bb_t)(dx > 0 || dy > 0) << x + y * board.width;
+      board.bodies |= (bb_t)1 << x + y * board.width;
     }
+
+    snake->head = (bb_t)1 << hx + hy * board.width;
+    snake->tail = (bb_t)1 << tx + ty * board.width;
   }
 
   TAC(parse);
 
-  // fprintf(stderr, "board (with eval %d):\n", boardeval(board, snakes));
-  // for (short y = board.h + BUFFER; --y >= -BUFFER;) {
-  //   for (short x = -BUFFER; x < board.w + BUFFER; x++)
-  //     fprintf(stderr, "%02hhx ", AT(board, y, x));
-  //   fputc('\n', stderr);
-  // }
+  // fprintf(stderr, "eval %hd\n", evaluate(&board));
 
   // fprintf(stderr, "%s\n", req);
 
-  int eval = 0;
+  short evals[MAX_DEPTH][4] = {0};
+
+  // XXX doc: iterative deepening: cache best moves and try them first
+  // on next search to increase number of pruned branches
   int depth = 0;
   clock_t start = clock();
-  while ((clock() - start) * 1.0 / CLOCKS_PER_SEC < MIN_SEARCH)
+  while (++depth < MAX_DEPTH &&
+         (clock() - start) * 1000 / CLOCKS_PER_SEC < T_CUTOFF)
     TICTAC(search)
-  eval = minimax(board, snakes, -1, INT_MIN, INT_MAX, ++depth);
+  minimax(&board, evals, 0, SCHAR_MAX >> 1, depth);
 
-  // extract the direction that was stuffed into the eval value
-  char *move = (char *[]){"right", "up", "left", "down"}[eval & 3];
+  // int depth = 20;
+  // TICTAC(search)
+  // minimax(&board, evals, 0, SCHAR_MAX >> 1, depth);
 
+  int m = 0;
+  for (int i = 0; i < 4; i++)
+    m = (*evals)[i] > (*evals)[m] ? i : m;
+
+  char *moves[] = {"left", "right", "down", "up"};
+
+  for (int i = 0; i < 4; i++)
+    fprintf(stderr, "%s:\t%hd\n", moves[i], (*evals)[i]);
   fprintf(stderr, "searched to depth %d\n", depth);
-  fprintf(stderr, "moving %s with eval %d\n", move, eval);
+  fprintf(stderr, "moving %s with eval %hd\n", moves[m], (*evals)[m]);
 
   printf("Status: 200 OK\nContent-Type: application/json\n\n");
-  printf("{\"move\":\"%s\"}\n", move);
-
-  free(board.cells);
+  printf("{\"move\":\"%s\"}\n", moves[m]);
 }
