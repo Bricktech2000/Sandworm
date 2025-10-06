@@ -1,2 +1,4 @@
 bin/
 *.log
+jsonw.c
+jsonw.h
