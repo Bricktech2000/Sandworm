@@ -1,24 +1,30 @@
 #include "jsonw.h"
 #include <inttypes.h>
 #include <limits.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-// XXX multithreading?
-// XXX Best Reply Search? https://notpeerreviewed.com/blog/battlesnake/
-
 // write diagnostics to `stderr` so cgi.conf can redirect them to a file
 
-#define MAX_DEPTH 64        // max search depth, for allocating a buffer
-#define MAX_SNAKES 4        // max number of snakes; the smaller the faster
-#define T_CUTOFF 200 / 1000 // cutoff to deepening the search, in seconds
-#define N_VORONOI 32        // number of Voronoi propagation steps
-#define K_OWNED 1           // reward for number of "owned" cells
-#define K_FOOD 0            // reward for number of "owned" food cells
-#define K_LENGTH 2          // reward for being longer than others
-#define K_HEALTH 0 / 100    // reward for having more health than others
+#define SEARCH_TIME 400 / 1000 // time at which a search is cut off, in seconds
+#define CHECK_DEPTH 8    // depth above which to check clock() < SEARCH_TIME
+#define MAX_VORONOI 32   // number of Voronoi propagation steps to perform
+#define MAX_DEPTH 32     // max search depth, for allocating buffers
+#define MAX_SNAKES 4     // max number of snakes, for allocating buffers
+#define K_OWNED 1        // reward for number of "owned" cells
+#define K_FOOD 0         // reward for number of "owned" food cells
+#define K_LENGTH 2       // reward for being longer than others
+#define K_HEALTH 0 / 100 // reward for having more health than others
+
+// a longer SEARCH_TIME yields better moves but risks hitting the 500ms round-
+// trip timeout. a smaller CHECK_DEPTH cuts off search closer to SEARCH_TIME
+// but impacts performance because of the frequent calls to clock(). a larger
+// MAX_VORONOI assesses boards more accurately but slows down search. a larger
+// MAX_DEPTH is more universal but can cause ping spikes in the endgame. a
+// larger MAX_SNAKES is more flexible but slows down search.
 
 #if defined(UINT128_MAX) // standard `uint128_t` is (probably) supported
 #
@@ -91,86 +97,83 @@ struct board {
   unsigned char width, height;
 };
 
-short evaluate(struct board *board) {
-  // Voronoi heuristic. a cell is "owned" by a snake if that snake can get to it
-  // before the other snakes. we make sure longer snakes move first because they
-  // would win out in a head-to-head collision
+bb_t adj(bb_t bb, struct board *board) {
+  // union of the bitboard shifted once in each cardinal direction
+  return (bb & board->xmask) >> 1 | bb << 1 & board->xmask |
+         bb >> board->width | bb << board->width & board->board;
+}
 
-  // use name 's' to index into `board->snakes` and 'l' to index into `sort`
+short eval(struct board *board) {
+  // Voronoi heuristic. a cell is "owned" if we can get to it before anyone else
 
-  // caching this sorting doesn't improve performance
-  int n = 0;
-  unsigned char sort[MAX_SNAKES]; // snake indices sorted by decreasing length
-  for (int s = 0; s < MAX_SNAKES; s++)
+  bb_t owned = board->snakes->head, lost = 0;
+  for (int s = 1; s < MAX_SNAKES; s++) {
+    bb_t temp = board->snakes[s].head;
+
+    // step the snakes that haven't yet moved this turn
+    if (board->snakes[s].head & board->heads)
+      temp |= adj(temp, board) & ~board->bodies;
+    // step the snakes that are longer than us because they would win out in a
+    // head-to-head collision
+    if (board->snakes[s].length >= board->snakes->length)
+      temp |= adj(temp, board) & ~board->bodies;
+
+    lost |= temp;
+  }
+
+  // the time complexity of this main part is constant in the number of snakes
+  for (int i = 0; i < MAX_VORONOI; i++) {
+    owned |= adj(owned, board) & ~board->bodies & ~lost;
+    lost |= adj(lost, board) & ~board->bodies & ~owned;
+  }
+
+  short eval = EVAL_ZERO + bb_popcnt(owned) * K_OWNED +
+               bb_popcnt(owned & board->food) * K_FOOD +
+               board->snakes->length * K_LENGTH +
+               board->snakes->health * K_HEALTH;
+  for (int s = 1; s < MAX_SNAKES; s++)
     if (board->snakes[s].health)
-      sort[n++] = s;
-  for (int temp, hi = n; hi--;)
-    for (int l = 0; l < hi; l++)
-      if (board->snakes[sort[l]].length < board->snakes[sort[l + 1]].length)
-        temp = sort[l], sort[l] = sort[l + 1], sort[l + 1] = temp;
-
-  bb_t filled = board->bodies;
-
-  bb_t owned[MAX_SNAKES];
-  for (int l = 0; l < n; l++)
-    owned[l] = board->snakes[sort[l]].head;
-
-  for (int i = 0; i < N_VORONOI; i++) {
-    for (int l = 0; l < n; l++) {
-      bb_t adjacent = 0;
-      adjacent |= (owned[l] & board->xmask) >> 1;
-      adjacent |= owned[l] << 1 & board->xmask;
-      adjacent |= owned[l] >> board->width;
-      adjacent |= owned[l] << board->width & board->board;
-
-      owned[l] |= adjacent & ~filled;
-      filled |= adjacent;
-    }
-  }
-
-  // XXX computing `owned[]` for all snakes but only using the one corresponding
-  // to the "you" snake. keeping it in, because in the future we may need to
-  // sort opponent moves based on how good they are for them
-  short eval = EVAL_ZERO;
-  for (int l = 0; l < n; l++) {
-    if (sort[l])
-      eval -= board->snakes[sort[l]].length * K_LENGTH +
-              board->snakes[sort[l]].health * K_HEALTH;
-    else
-      eval += bb_popcnt(owned[l]) * K_OWNED +
-              bb_popcnt(owned[l] & board->food) * K_FOOD +
-              board->snakes->length * K_LENGTH +
-              board->snakes->health * K_HEALTH;
-  }
+      eval -= board->snakes[s].length * K_LENGTH +
+              board->snakes[s].health * K_HEALTH;
 
   return eval;
 }
 
-short minimax(struct board *board, int *best, short (*evals)[4], short alpha,
-              short beta, int depth);
-short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
-                   short alpha, short beta, int depth) {
-  // perform one minimax step. in one "step", one snake moves once
+struct best {
+  short eval;
+  unsigned char move;
+};
+
+struct best turn(clock_t start, jmp_buf abort /* to abort a search */,
+                 struct board *board /* modified in-place then restored */,
+                 short (*evals)[4] /* a cache for iterative deepening */,
+                 short alpha, short beta, int depth);
+
+struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
+                 short (*evals)[4], short alpha, short beta, int depth) {
+  // perform one minimax step. in one "step", only one snake moves
 
   if (!board->snakes->health)
-    return EVAL_MIN;
+    return (struct best){EVAL_MIN};
 
   if (depth == 0)
-    // XXX doc least significant bit for mark
-    return evaluate(board) * 2;
+    // `* 2` because the least significant bit of evals is is used as a mark
+    return (struct best){eval(board) * 2};
+
+  if (depth >= CHECK_DEPTH && clock() - start > CLOCKS_PER_SEC * SEARCH_TIME)
+    longjmp(abort, 1);
 
   // skip over dead snakes and find the next live snake. if we iterate past the
-  // last snake, then all live snakes have moved this turn, so call `minimax` to
+  // last snake, then all live snakes have moved this turn, so call `turn` to
   // begin the next turn
   do
     if (++s == MAX_SNAKES)
-      return minimax(board, best, evals, alpha, beta, depth);
+      return turn(start, abort, board, evals, alpha, beta, depth);
   while (!board->snakes[s].health);
 
   struct snake *snake = board->snakes + s;
 
-  // shifting right by 1 to leave some buffer to avoid wraparound
-  short eval = s ? EVAL_MAX : EVAL_MIN;
+  struct best best = {s ? EVAL_MAX : EVAL_MIN, 0};
   unsigned char length = snake->length, health = snake->health;
   unsigned char taillag = snake->taillag;
   bool did_recurse = false;
@@ -178,15 +181,6 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
   // about to move, so remove our head from the bitboard containing the heads of
   // snakes that haven't yet moved this turn
   board->heads &= ~snake->head;
-
-  // TODO need a tie breaker for moving adjacent to a longer snake's head -->
-  // should be fixed. make sure actually fixed
-
-  // XXX doc: minimax invariants. these impact performance but should have no
-  // effect on evals:
-  //   - disabling alpha-beta pruning --> not true
-  //   - changing move ordering (ignoring the cached evals)
-  //   - going to a given depth right away instead of iteratively
 
   for (int i = 0; i < 4; i++) {
     // iterative deepening: explore more promising moves first (as given
@@ -197,22 +191,21 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
     for (short *e = *evals; e < *evals + 4; e++)
       evalp = (*evalp & 1) || !(*e & 1) && *e > *evalp == !s ? e : evalp;
 
-    // XXX invariant
-    // if (depth == 20)
-    //   printf("%zd\n", evalp - *evals);
-
-    // XXX invariants
+    // invariant: uncommenting either of these may slow down search and give
+    // different evals but should never change what the final best `move` is
     // short *evalp = *evals + i;
     // short *evalp = *evals + 3 - i;
 
-    // default to the worst possible eval, for `continue`s and `goto contin`s
+    // invariant: uncommenting this should output all moves (0, 1, 2 and 3),
+    // regardless of their order
+    // if (depth == 20)
+    //   printf("%zd\n", evalp - *evals);
+
+    // default to the worst possible eval, for `continue`s and `goto`s
     *evalp = (s ? EVAL_MAX : EVAL_MIN) | 1;
 
     // when minimax is hopelessly broken and commenting out these two lines
     // fixes it, it's likely there's an eval overflowing somewhere
-    // XXX doc because of alpha--beta pruning, root *evals are not the actual
-    // evals, they're upper bounds on evals. so we need *best so we can store
-    // the move that leads to the actual that eval
     if (alpha >= beta)
       continue;
 
@@ -232,20 +225,15 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
     if (snake->head & board->bodies)
       goto contin; // would collide with another snake
 
-    bb_t adjacent = 0;
-    adjacent |= (snake->head & board->xmask) >> 1;
-    adjacent |= snake->head << 1 & board->xmask;
-    adjacent |= snake->head >> board->width;
-    adjacent |= snake->head << board->width & board->board;
-
     // can't move adjacent to the head of a longer snake that hasn't yet moved
     // this turn because they could kill us by moving onto our head
-    if (adjacent & board->heads)
+    bb_t head_adj = adj(snake->head, board);
+    if (head_adj & board->heads)
       for (int r = s + 1; r < MAX_SNAKES; r++)
         if (board->snakes[r].length >= snake->length &&
-            board->snakes[r].health && (adjacent & board->snakes[r].head)) {
+            board->snakes[r].health && (head_adj & board->snakes[r].head)) {
           // tie breaker: prefer a probable head-to-head death to certain death
-          *evalp += 4;
+          *evalp += 8;
           goto update;
         }
 
@@ -258,25 +246,26 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
       board->food &= ~snake->head;
     }
 
+    // `+2` because the least significant bit of evals is is used as a mark.
     // tie breaker: even when certain death is coming, survive as long as we can
-    int tiebreak = 2;
+    int tiebreak = +2;
     // tie breaker: certain death is better if it's contingent on an opponent
-    tiebreak += s ? 2 : 0;
+    tiebreak += s ? +2 : 0;
 
-    // XXX is it right to subtract tiebreak from α and β like this?
     did_recurse = true;
-    *evalp = minimax_step(s, board, &(int){0}, evals + 1, alpha - tiebreak,
-                          beta - tiebreak, depth - 1) +
-             tiebreak;
+    // clang-format off
+    *evalp = step(s, start, abort, board, evals + 1, alpha - tiebreak,
+                  beta - tiebreak, depth - 1).eval + tiebreak;
+    // clang-format on
 
   update:
-    if (s && *evalp < eval) {
-      eval = *evalp, *best = evalp - *evals;
-      beta = eval < beta ? eval : beta;
+    if (s && *evalp < best.eval) {
+      best.eval = *evalp, best.move = evalp - *evals;
+      beta = best.eval < beta ? best.eval : beta;
     }
-    if (!s && *evalp > eval) {
-      eval = *evalp, *best = evalp - *evals;
-      alpha = eval > alpha ? eval : alpha;
+    if (!s && *evalp > best.eval) {
+      best.eval = *evalp, best.move = evalp - *evals;
+      alpha = best.eval > alpha ? best.eval : alpha;
     }
 
     // mark the cached eval as explored
@@ -293,7 +282,7 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
          : (snake->head <<= axis ? board->width : 1);
   }
 
-  // unmark the evals we've just cached, for the next iterative deepening step
+  // unmark the evals we've just cached, to prepare for subsequent deepenings
   for (short *e = *evals; e < *evals + 4; e++)
     *e &= ~1;
 
@@ -302,17 +291,17 @@ short minimax_step(int s, struct board *board, int *best, short (*evals)[4],
   // branches that lead to immediate death
   if (s && !did_recurse) {
     snake->health = 0;
-    eval = minimax_step(s, board, &(int){0}, evals + 1, alpha, beta, depth - 1);
+    best = step(s, start, abort, board, evals + 1, alpha, beta, depth - 1);
     snake->health = health;
   }
 
   board->heads |= snake->head;
 
-  return eval;
+  return best;
 }
 
-short minimax(struct board *board, int *best, short (*evals)[4], short alpha,
-              short beta, int depth) {
+struct best turn(clock_t start, jmp_buf abort, struct board *board,
+                 short (*evals)[4], short alpha, short beta, int depth) {
   // perform one minimax turn. in one "turn", each snake moves once
 
 #if MAX_SNAKES <= 8
@@ -347,7 +336,7 @@ short minimax(struct board *board, int *best, short (*evals)[4], short alpha,
              : (snake->tail >>= axes & 1 ? board->width : 1);
   }
 
-  short eval = minimax_step(-1, board, best, evals, alpha, beta, depth);
+  struct best best = step(-1, start, abort, board, evals, alpha, beta, depth);
 
   for (int s = MAX_SNAKES; s--;) {
     struct snake *snake = board->snakes + s;
@@ -367,7 +356,7 @@ short minimax(struct board *board, int *best, short (*evals)[4], short alpha,
 
   board->heads = 0;
 
-  return eval;
+  return best;
 }
 
 int main(void) {
@@ -378,12 +367,6 @@ int main(void) {
   if (!feof(stdin))
     fputs("request buffer exhausted\n", stderr), exit(EXIT_FAILURE);
   req[size] = '\0';
-
-  // XXX shout
-  // printf("Status: 200 OK\nContent-Type: application/json\n\n");
-  // printf("{\"move\":\"right\",\"shout\":\"foobar\"}\n");
-  // fprintf(stderr, "%s\n", req);
-  // return 0;
 
   // see example-move.json
 
@@ -482,43 +465,60 @@ int main(void) {
     snake->tail = (bb_t)1 << tx + ty * board.width;
   }
 
-  // fprintf(stderr, "eval %hd\n", evaluate(&board));
+  // fprintf(stderr, "eval %hd\n", eval(&board));
 
   // fprintf(stderr, "%s\n", req);
 
   short evals[MAX_DEPTH][4] = {0};
 
-  // // XXX uncomment
-  // srand(seed);
-  // for (int d = 0; d < MAX_DEPTH; d++)
-  //   for (int m = 0; m < 4; m++)
-  //     evals[d][m] = rand() & USHRT_MAX & ~1;
+  // invariant: commenting this out may give different evals but should never
+  // change what the final `best.move` is
+  srand(seed);
+  for (int d = 0; d < MAX_DEPTH; d++)
+    for (unsigned char m = 0; m < 4; m++)
+      evals[d][m] = rand() & USHRT_MAX & ~1;
 
-  // int depth = 20;
-  // minimax(&board, evals, EVAL_MIN, EVAL_MAX, depth);
+  unsigned char move = 0;
+  short root_evals[4] = {0};
 
   // iterative deepening: iteratively search deeper and deeper until we hit
-  // `T_CUTOFF`, caching move evals as we go along so we can prune more branches
-  // in subsequent iterations
-  int best = 0;
+  // `SEARCH_TIME`, caching move evals as we go along so we can prune more
+  // branches in subsequent iterations. it's important to realize that with
+  // alpha--beta pruning, cached evals are lower/upper bounds on the real
+  // evals, so they can't be used to deduce the final `best.move`
+
+  clock_t start = clock(), prev = start;
   fprintf(stderr, "\nDEPTH\tMICROS\tTOTAL\n");
-  clock_t start = clock(), now = start, prev = now;
-  for (int depth = 1; depth <= MAX_DEPTH; depth++) {
-    if ((now - start) > CLOCKS_PER_SEC * T_CUTOFF)
+  for (int depth = 0; depth <= MAX_DEPTH; depth++) {
+    jmp_buf abort;
+    if (setjmp(abort) != 0)
       break;
-    minimax(&board, &best, evals, EVAL_MIN, EVAL_MAX, depth);
-    prev = now, now = clock();
-    fprintf(stderr, "%d\t%07lld\t%07lld\n", depth,
+
+    move = turn(start, abort, &board, evals, EVAL_MIN, EVAL_MAX, depth).move;
+    memcpy(root_evals, *evals, sizeof(root_evals));
+
+    clock_t now = clock();
+    fprintf(stderr, "%d\t%06lld\t%06lld\n", depth,
             (long long)(now - prev) * 1000000 / CLOCKS_PER_SEC,
             (long long)(now - start) * 1000000 / CLOCKS_PER_SEC);
+    prev = now;
   }
+
+  fprintf(stderr, "ABORT\t\t%06lld\n",
+          (long long)(clock() - start) * 1000000 / CLOCKS_PER_SEC);
+
+  // invariant: uncommenting this and commenting out iterative deepening may
+  // slow down search and give different evals but should never change what
+  // the final `best.move` is
+  // move = turn(0, (jmp_buf){0}, &board, evals, EVAL_MIN, EVAL_MAX, 20).move;
+  // memcpy(root_evals, *evals, sizeof(root_evals));
 
   char *moves[] = {"left", "right", "down", "up"}; // JSON escaped
 
   fprintf(stderr, "\nMOVE\tEVAL\tBEST\n");
   for (int m = 0; m < 4; m++)
-    fprintf(stderr, "%s\t%+hd\t%d\n", moves[m], (*evals)[m], best == m);
+    fprintf(stderr, "%s\t%+hd\t%d\n", moves[m], root_evals[m], move == m);
 
   printf("Status: 200 OK\nContent-Type: application/json\n\n");
-  printf("{\"move\":\"%s\"}\n", moves[best]);
+  printf("{\"move\":\"%s\"}\n", moves[move]);
 }

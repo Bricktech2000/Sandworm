@@ -11,7 +11,7 @@ bin/start: start.c | bin/
 	$(CC) $(CFLAGS) $^ -o $@
 
 bin/move: move.c jsonw.c jsonw.h | bin/
-	$(CC) $(CFLAGS) -march=native -Wno-parentheses -Wno-unused-value \
+	$(CC) $(CFLAGS) -march=native -Wno-parentheses -Wno-unused-value -Wno-missing-field-initializers \
 		move.c jsonw.c -o $@
 
 bin/end: end.c | bin/
