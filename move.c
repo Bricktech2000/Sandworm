@@ -7,24 +7,23 @@
 #include <string.h>
 #include <time.h>
 
-// write diagnostics to `stderr` so cgi.conf can redirect them to a file
+// write all diagnostics to `stderr` so cgi.conf can redirect them to a file
 
+// a longer SEARCH_TIME yields better moves but risks hitting the 500ms round-
+// trip timeout. a smaller CHECK_DEPTH cuts off search closer to SEARCH_TIME
+// but impacts performance because of the frequent calls to clock(). a larger
+// MAX_VORONOI assesses boards more accurately but slows down search. a larger
+// MAX_DEPTH is more universal but can cause latency spikes in the endgame. a
+// larger MAX_SNAKES is more flexible but slows down search.
 #define SEARCH_TIME 400 / 1000 // time at which a search is cut off, in seconds
 #define CHECK_DEPTH 8    // depth above which to check clock() < SEARCH_TIME
 #define MAX_VORONOI 32   // number of Voronoi propagation steps to perform
 #define MAX_DEPTH 32     // max search depth, for allocating buffers
 #define MAX_SNAKES 4     // max number of snakes, for allocating buffers
 #define K_OWNED 1        // reward for number of "owned" cells
-#define K_FOOD 0         // reward for number of "owned" food cells
-#define K_LENGTH 2       // reward for being longer than others
+#define K_FOOD 1         // reward for number of "owned" food cells
+#define K_LENGTH 4       // reward for being longer than others
 #define K_HEALTH 0 / 100 // reward for having more health than others
-
-// a longer SEARCH_TIME yields better moves but risks hitting the 500ms round-
-// trip timeout. a smaller CHECK_DEPTH cuts off search closer to SEARCH_TIME
-// but impacts performance because of the frequent calls to clock(). a larger
-// MAX_VORONOI assesses boards more accurately but slows down search. a larger
-// MAX_DEPTH is more universal but can cause ping spikes in the endgame. a
-// larger MAX_SNAKES is more flexible but slows down search.
 
 #if defined(UINT128_MAX) // standard `uint128_t` is (probably) supported
 #
@@ -35,7 +34,8 @@
 #error "provide definitions for `uint128_t` and `UINT128_MAX`"
 #endif
 
-#define OUT_PARAM(TYPE, IDENT) /* taken verbatim from jsonw.c */               \
+// taken verbatim from jsonw.c
+#define OUT_PARAM(TYPE, IDENT)                                                 \
   TYPE _out_param_##IDENT;                                                     \
   if (IDENT == NULL)                                                           \
   IDENT = &_out_param_##IDENT
@@ -49,11 +49,7 @@ char *jsonw_uchar(unsigned char *num, char *json) {
   return NULL;
 }
 
-#define EVAL_MIN (SHRT_MIN / 2)
-#define EVAL_MAX (SHRT_MAX / 2)
-#define EVAL_ZERO 0
-
-typedef uint128_t bb_t; // bit board
+typedef uint128_t bb_t; // bitboard
 
 int bb_popcnt(bb_t bb) {
   // codegens into a pair of `popcnt` instructions
@@ -103,8 +99,13 @@ bb_t adj(bb_t bb, struct board *board) {
          bb >> board->width | bb << board->width & board->board;
 }
 
+#define EVAL_MIN (SHRT_MIN / 2)
+#define EVAL_MAX (SHRT_MAX / 2)
+#define EVAL_ZERO 0
+
 short eval(struct board *board) {
-  // Voronoi heuristic. a cell is "owned" if we can get to it before anyone else
+  // Voronoi heuristic. 'owned' cells we can reach strictly before anyone else
+  // and 'lost' cells we cannot
 
   bb_t owned = board->snakes->head, lost = 0;
   for (int s = 1; s < MAX_SNAKES; s++) {
@@ -113,20 +114,22 @@ short eval(struct board *board) {
     // step the snakes that haven't yet moved this turn
     if (board->snakes[s].head & board->heads)
       temp |= adj(temp, board) & ~board->bodies;
-    // step the snakes that are longer than us because they would win out in a
-    // head-to-head collision
+    // step the snakes that are at least as long as us, because they would kill
+    // us in a head-to-head collision
     if (board->snakes[s].length >= board->snakes->length)
       temp |= adj(temp, board) & ~board->bodies;
 
     lost |= temp;
   }
 
-  // the time complexity of this main part is constant in the number of snakes
+  // perform Voronoi propagation steps. notice that the time complexity of this
+  // main bit is constant in the number of snakes
   for (int i = 0; i < MAX_VORONOI; i++) {
     owned |= adj(owned, board) & ~board->bodies & ~lost;
     lost |= adj(lost, board) & ~board->bodies & ~owned;
   }
 
+  // combine the Voronoi heuristic with other metrics to produce a board eval
   short eval = EVAL_ZERO + bb_popcnt(owned) * K_OWNED +
                bb_popcnt(owned & board->food) * K_FOOD +
                board->snakes->length * K_LENGTH +
@@ -157,14 +160,14 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
     return (struct best){EVAL_MIN};
 
   if (depth == 0)
-    // `* 2` because the least significant bit of evals is is used as a mark
+    // `* 2` because the least significant bit of evals is used as a mark
     return (struct best){eval(board) * 2};
 
   if (depth >= CHECK_DEPTH && clock() - start > CLOCKS_PER_SEC * SEARCH_TIME)
     longjmp(abort, 1);
 
   // skip over dead snakes and find the next live snake. if we iterate past the
-  // last snake, then all live snakes have moved this turn, so call `turn` to
+  // last snake, then all live snakes have moved this turn, so call `turn()` to
   // begin the next turn
   do
     if (++s == MAX_SNAKES)
@@ -173,7 +176,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
 
   struct snake *snake = board->snakes + s;
 
-  struct best best = {s ? EVAL_MAX : EVAL_MIN, 0};
+  struct best best = {s ? EVAL_MAX : EVAL_MIN};
   unsigned char length = snake->length, health = snake->health;
   unsigned char taillag = snake->taillag;
   bool did_recurse = false;
@@ -233,7 +236,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
         if (board->snakes[r].length >= snake->length &&
             board->snakes[r].health && (head_adj & board->snakes[r].head)) {
           // tie breaker: prefer a probable head-to-head death to certain death
-          *evalp += 8;
+          *evalp += 16;
           goto update;
         }
 
@@ -246,7 +249,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
       board->food &= ~snake->head;
     }
 
-    // `+2` because the least significant bit of evals is is used as a mark.
+    // `+2` because the least significant bit of evals is used as a mark.
     // tie breaker: even when certain death is coming, survive as long as we can
     int tiebreak = +2;
     // tie breaker: certain death is better if it's contingent on an opponent
@@ -465,15 +468,20 @@ int main(void) {
     snake->tail = (bb_t)1 << tx + ty * board.width;
   }
 
-  // fprintf(stderr, "eval %hd\n", eval(&board));
-
   // fprintf(stderr, "%s\n", req);
+
+  time_t t = time(NULL);
+  struct tm *tm = localtime(&t);
+  char buf[sizeof("1999-12-31T23:59:59+0000")]; // ISO 8601
+  if (strftime(buf, sizeof(buf), "%FT%T%z", tm) == 0)
+    abort();
+  fprintf(stderr, "\n%s\n", buf);
 
   short evals[MAX_DEPTH][4] = {0};
 
   // invariant: commenting this out may give different evals but should never
   // change what the final `best.move` is
-  srand(seed);
+  srand(seed); // deterministic
   for (int d = 0; d < MAX_DEPTH; d++)
     for (unsigned char m = 0; m < 4; m++)
       evals[d][m] = rand() & USHRT_MAX & ~1;
