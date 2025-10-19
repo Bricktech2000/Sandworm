@@ -7,7 +7,10 @@
 #include <string.h>
 #include <time.h>
 
-// write all diagnostics to `stderr` so cgi.conf can redirect them to a file
+// `stdout` is solely for the request response; any logging goes in `stderr`
+// so cgi.conf can redirect it to a file. also, be careful when benchmarking:
+// any modification that changes evals will change what branches get pruned,
+// and that will dominate measurements
 
 // a longer SEARCH_TIME yields better moves but risks hitting the 500ms round-
 // trip timeout. a smaller CHECK_DEPTH cuts off search closer to SEARCH_TIME
@@ -122,8 +125,9 @@ short eval(struct board *board) {
     lost |= temp;
   }
 
-  // perform Voronoi propagation steps. notice that the time complexity of this
-  // main bit is constant in the number of snakes
+  // perform Voronoi propagation steps. this is by far the hottest part of the
+  // program, as confirmed by profiling. notice that its time complexity is
+  // constant in the number of snakes
   for (int i = 0; i < MAX_VORONOI; i++) {
     owned |= adj(owned, board) & ~board->bodies & ~lost;
     lost |= adj(lost, board) & ~board->bodies & ~owned;
