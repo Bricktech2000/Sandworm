@@ -22,7 +22,7 @@ Sandworm runs paranoid minimax with α–β pruning and iterative deepening over
 
 ## Usage
 
-Copy-paste in jsonw.c and jsonw.h from my JSONW library. Then, build and run the server with:
+Build and run the server with:
 
 ```sh
 make all

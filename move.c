@@ -1,4 +1,4 @@
-#include "jsonw.h"
+#include "vendor/jsonw.h"
 #include <inttypes.h>
 #include <limits.h>
 #include <setjmp.h>
@@ -37,7 +37,7 @@
 #error "provide definitions for `uint128_t` and `UINT128_MAX`"
 #endif
 
-// taken verbatim from jsonw.c
+// taken verbatim from vendor/jsonw.c
 #define OUT_PARAM(TYPE, IDENT)                                                 \
   TYPE _out_param_##IDENT;                                                     \
   if (IDENT == NULL)                                                           \
