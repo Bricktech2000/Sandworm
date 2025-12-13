@@ -18,6 +18,7 @@
 // MAX_VORONOI assesses boards more accurately but slows down search. a larger
 // MAX_DEPTH is more universal but can cause latency spikes in the endgame. a
 // larger MAX_SNAKES is more flexible but slows down search.
+#define TOTAL_TIME 500 / 1000  // game engine's round-trip timeout, in seconds
 #define SEARCH_TIME 400 / 1000 // time at which a search is cut off, in seconds
 #define CHECK_DEPTH 8    // depth above which to check clock() < SEARCH_TIME
 #define MAX_VORONOI 32   // number of Voronoi propagation steps to perform
@@ -151,12 +152,12 @@ struct best {
   unsigned char move;
 };
 
-struct best turn(clock_t start, jmp_buf abort /* to abort a search */,
+struct best turn(clock_t cutoff, jmp_buf abort /* to abort a search */,
                  struct board *board /* modified in-place then restored */,
                  short (*evals)[4] /* a cache for iterative deepening */,
                  short alpha, short beta, int depth);
 
-struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
+struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
                  short (*evals)[4], short alpha, short beta, int depth) {
   // perform one minimax step. in one "step", only one snake moves
 
@@ -167,7 +168,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
     // `* 2` because the least significant bit of evals is used as a mark
     return (struct best){eval(board) * 2};
 
-  if (depth >= CHECK_DEPTH && clock() - start > CLOCKS_PER_SEC * SEARCH_TIME)
+  if (depth >= CHECK_DEPTH && clock() > cutoff)
     longjmp(abort, 1);
 
   // skip over dead snakes and find the next live snake. if we iterate past the
@@ -175,7 +176,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
   // begin the next turn
   do
     if (++s == MAX_SNAKES)
-      return turn(start, abort, board, evals, alpha, beta, depth);
+      return turn(cutoff, abort, board, evals, alpha, beta, depth);
   while (!board->snakes[s].health);
 
   struct snake *snake = board->snakes + s;
@@ -261,7 +262,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
 
     did_recurse = true;
     // clang-format off
-    *evalp = step(s, start, abort, board, evals + 1, alpha - tiebreak,
+    *evalp = step(s, cutoff, abort, board, evals + 1, alpha - tiebreak,
                   beta - tiebreak, depth - 1).eval + tiebreak;
     // clang-format on
 
@@ -298,7 +299,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
   // branches that lead to immediate death
   if (s && !did_recurse) {
     snake->health = 0;
-    best = step(s, start, abort, board, evals + 1, alpha, beta, depth - 1);
+    best = step(s, cutoff, abort, board, evals + 1, alpha, beta, depth - 1);
     snake->health = health;
   }
 
@@ -307,7 +308,7 @@ struct best step(int s, clock_t start, jmp_buf abort, struct board *board,
   return best;
 }
 
-struct best turn(clock_t start, jmp_buf abort, struct board *board,
+struct best turn(clock_t cutoff, jmp_buf abort, struct board *board,
                  short (*evals)[4], short alpha, short beta, int depth) {
   // perform one minimax turn. in one "turn", each snake moves once
 
@@ -343,7 +344,7 @@ struct best turn(clock_t start, jmp_buf abort, struct board *board,
              : (snake->tail >>= axes & 1 ? board->width : 1);
   }
 
-  struct best best = step(-1, start, abort, board, evals, alpha, beta, depth);
+  struct best best = step(-1, cutoff, abort, board, evals, alpha, beta, depth);
 
   for (int s = MAX_SNAKES; s--;) {
     struct snake *snake = board->snakes + s;
@@ -416,7 +417,8 @@ int main(void) {
   }
 
   int s = 1;
-  unsigned int seed = 0; // for srand()
+  unsigned int seed = 0;       // for srand()
+  unsigned char prev_move = 4; // 4 is an invalid move
   char *j_snakes = jsonw_lookup("snakes", jsonw_beginobj(j_board));
   for (char *j_snake = jsonw_beginarr(j_snakes); j_snake;
        j_snake = jsonw_element(j_snake)) {
@@ -454,17 +456,20 @@ int main(void) {
 
       seed <<= 1, seed ^= x ^ y;
       signed char dx = tx - x, dy = ty - y;
+      bool axis = dy != 0, sign = dx > 0 || dy > 0;
 
       if (hx == -1 && hy == -1)
         hx = x, hy = y;
+      else if (is_you && prev_move == 4)
+        prev_move = axis << 1 | sign;
       if (tx == x && ty == y)
         // several body parts stacked on top of eachother represents tail lag
         snake->taillag++;
       tx = x, ty = y;
 
       // store the path toward the head in `snake.axis` and `snake.sign`
-      snake->axis |= (bb_t)(dy != 0) << x + y * board.width;
-      snake->sign |= (bb_t)(dx > 0 || dy > 0) << x + y * board.width;
+      snake->axis |= (bb_t)axis << x + y * board.width;
+      snake->sign |= (bb_t)sign << x + y * board.width;
       board.bodies |= (bb_t)1 << x + y * board.width;
     }
 
@@ -506,8 +511,15 @@ int main(void) {
     if (setjmp(abort) != 0)
       break;
 
-    move = turn(start, abort, &board, evals, EVAL_MIN, EVAL_MAX, depth).move;
-    memcpy(root_evals, *evals, sizeof(root_evals));
+    // if the game engine doesn't receive our move within `TOTAL_TIME`, we time
+    // out and the move we made on the previous turn is repeated. so when the
+    // current `best.move` happens to be the same as our previous move, timing
+    // out is okay and we can keep on searching past `SEARCH_TIME`. credit to
+    // John Scales for the idea
+    clock_t cutoff = move == prev_move ? start + CLOCKS_PER_SEC * TOTAL_TIME
+                                       : start + CLOCKS_PER_SEC * SEARCH_TIME;
+    move = turn(cutoff, abort, &board, evals, EVAL_MIN, EVAL_MAX, depth).move;
+    memcpy(root_evals, evals, sizeof(root_evals));
 
     clock_t now = clock();
     fprintf(stderr, "%d\t%06lld\t%06lld\n", depth,
