@@ -107,7 +107,10 @@ bb_t adj(bb_t bb, struct board *board) {
 #define EVAL_MAX (SHRT_MAX / 2)
 #define EVAL_ZERO 0
 
+int n_evals = 0;
 short eval(struct board *board) {
+  n_evals++;
+
   // Voronoi heuristic. 'owned' cells we can reach strictly before anyone else
   // and 'lost' cells we cannot
 
@@ -505,7 +508,7 @@ int main(void) {
   // evals, so they can't be used to deduce the final `best.move`
 
   clock_t start = clock(), prev = start;
-  fprintf(stderr, "\nDEPTH\tMICROS\tTOTAL\n");
+  fprintf(stderr, "\nDEPTH\tMICROS\tTOTAL\tEVALS\tEVALS/S\n");
   for (int depth = 0; depth <= MAX_DEPTH; depth++) {
     jmp_buf abort;
     if (setjmp(abort) != 0)
@@ -522,14 +525,18 @@ int main(void) {
     memcpy(root_evals, evals, sizeof(root_evals));
 
     clock_t now = clock();
-    fprintf(stderr, "%d\t%06lld\t%06lld\n", depth,
+    fprintf(stderr, "%d\t%06lld\t%06lld\t%7d\t%7lld\n", depth,
             (long long)(now - prev) * 1000000 / CLOCKS_PER_SEC,
-            (long long)(now - start) * 1000000 / CLOCKS_PER_SEC);
+            (long long)(now - start) * 1000000 / CLOCKS_PER_SEC, n_evals,
+            (long long)n_evals * CLOCKS_PER_SEC / (now - start));
     prev = now;
   }
 
-  fprintf(stderr, "ABORT\t\t%06lld\n",
-          (long long)(clock() - start) * 1000000 / CLOCKS_PER_SEC);
+  clock_t now = clock();
+  fprintf(stderr, "ABORT\t%06lld\t%06lld\t%7d\t%7lld\n",
+          (long long)(now - prev) * 1000000 / CLOCKS_PER_SEC,
+          (long long)(now - start) * 1000000 / CLOCKS_PER_SEC, n_evals,
+          (long long)n_evals * CLOCKS_PER_SEC / (now - start));
 
   // invariant: uncommenting this and commenting out iterative deepening may
   // slow down search and give different evals but should never change what
