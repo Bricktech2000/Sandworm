@@ -22,7 +22,7 @@
 #define SEARCH_TIME 400 / 1000 // time at which a search is cut off, in seconds
 #define CHECK_DEPTH 8    // depth above which to check clock() < SEARCH_TIME
 #define MAX_VORONOI 32   // number of Voronoi propagation steps to perform
-#define MAX_DEPTH 32     // max search depth, for allocating buffers
+#define MAX_DEPTH 64     // max search depth, for allocating buffers
 #define MAX_SNAKES 4     // max number of snakes, for allocating buffers
 #define K_OWNED 1        // reward for number of "owned" cells
 #define K_FOOD 1         // reward for number of "owned" food cells
@@ -73,21 +73,20 @@ struct snake {
   // making the head and tail `unsigned char`s doesn't improve performance and
   // complicates the code
   bb_t head, tail;
-  // these two bitboards contain the path to the head, so we know how to move
-  // the tail. axis=0 means X axis (bitboard shift by `1`); axis=1 means Y axis
+  // `axis` and `sign` contain the path to the head, so we know how to move the
+  // tail. axis=0 means X axis (bitboard shift by `1`); axis=1 means Y axis
   // (bitboard shift by `board.width`). sign=0 means right/down (bitboard right
   // shift); sign=1 means left/up (bitboard left shift)
-  bb_t axis, sign;
+  bb_t body, axis, sign;
   unsigned char length, health;
   unsigned char taillag; // number of turns to wait before moving the tail
 };
 
 struct board {
   struct snake snakes[MAX_SNAKES];
-  // `food` holds the cells with food, `bodies` holds the union of all snake
-  // bodies, and `heads` holds the heads of all snakes that haven't yet moved
-  // on the current turn
-  bb_t food, bodies, heads;
+  // `food` holds the cells with food and `heads` holds the heads of all snakes
+  // that haven't yet moved on the current turn
+  bb_t food, heads;
   // these two bitboards they are initialized once and never modified again.
   // `board` is a bit mask that contains every cell of the board, so we can mask
   // out excess bits in a `bb_t` that are outside the board. `xmask` is the same
@@ -111,20 +110,30 @@ int n_evals = 0;
 short eval(struct board *board) {
   n_evals++;
 
+  // note that the tail of every snake is removed at the beginning of each turn,
+  // so there is no need to correct for anything here
+  bb_t bodies = 0;
+  for (int s = 0; s < MAX_SNAKES; s++)
+    if (board->snakes[s].health)
+      bodies |= board->snakes[s].body;
+
   // Voronoi heuristic. 'owned' cells we can reach strictly before anyone else
   // and 'lost' cells we cannot
 
   bb_t owned = board->snakes->head, lost = 0;
   for (int s = 1; s < MAX_SNAKES; s++) {
+    if (!board->snakes[s].health)
+      continue;
+
     bb_t temp = board->snakes[s].head;
 
     // step the snakes that haven't yet moved this turn
     if (board->snakes[s].head & board->heads)
-      temp |= adj(temp, board) & ~board->bodies;
+      temp |= adj(temp, board) & ~bodies;
     // step the snakes that are at least as long as us, because they would kill
     // us in a head-to-head collision
     if (board->snakes[s].length >= board->snakes->length)
-      temp |= adj(temp, board) & ~board->bodies;
+      temp |= adj(temp, board) & ~bodies;
 
     lost |= temp;
   }
@@ -133,15 +142,27 @@ short eval(struct board *board) {
   // program, as confirmed by profiling. notice that its time complexity is
   // constant in the number of snakes
   for (int i = 0; i < MAX_VORONOI; i++) {
-    owned |= adj(owned, board) & ~board->bodies & ~lost;
-    lost |= adj(lost, board) & ~board->bodies & ~owned;
+    owned |= adj(owned, board) & ~bodies & ~lost;
+    lost |= adj(lost, board) & ~bodies & ~owned;
+  }
+
+  // if we own a cell adjacent to a snake's tail, it's probably we could follow
+  // that tail for a while, so guess that we own about half that snake's body.
+  // the same goes for lost cells. this metric should be useful in the endgame.
+  int n_owned = bb_popcnt(owned), n_lost = bb_popcnt(lost);
+  for (int s = 0; s < MAX_SNAKES; s++) {
+    if (!board->snakes[s].health)
+      continue;
+    if (adj(owned, board) & board->snakes[s].tail)
+      n_owned += bb_popcnt(board->snakes[s].body) / 2;
+    if (adj(lost, board) & board->snakes[s].tail)
+      n_lost += bb_popcnt(board->snakes[s].body) / 2;
   }
 
   // combine the Voronoi heuristic with other metrics to produce a board eval
-  short eval = EVAL_ZERO + bb_popcnt(owned) * K_OWNED +
-               bb_popcnt(owned & board->food) * K_FOOD +
-               board->snakes->length * K_LENGTH +
-               board->snakes->health * K_HEALTH;
+  short eval =
+      EVAL_ZERO + n_owned * K_OWNED + bb_popcnt(owned & board->food) * K_FOOD +
+      board->snakes->length * K_LENGTH + board->snakes->health * K_HEALTH;
   for (int s = 1; s < MAX_SNAKES; s++)
     if (board->snakes[s].health)
       eval -= board->snakes[s].length * K_LENGTH +
@@ -214,6 +235,7 @@ struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
 
     // default to the worst possible eval, for `continue`s and `goto`s
     *evalp = (s ? EVAL_MAX : EVAL_MIN) | 1;
+    int tiebreak = 0;
 
     // when minimax is hopelessly broken and commenting out these two lines
     // fixes it, it's likely there's an eval overflowing somewhere
@@ -233,8 +255,9 @@ struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
     sign ? (snake->head <<= axis ? board->width : 1)
          : (snake->head >>= axis ? board->width : 1);
 
-    if (snake->head & board->bodies)
-      goto contin; // would collide with another snake
+    for (int r = 0; r < MAX_SNAKES; r++)
+      if (board->snakes[r].health && (snake->head & board->snakes[r].body))
+        goto contin; // would collide with another snake
 
     // can't move adjacent to the head of a longer snake that hasn't yet moved
     // this turn because they could kill us by moving onto our head
@@ -244,14 +267,13 @@ struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
         if (board->snakes[r].length >= snake->length &&
             board->snakes[r].health && (head_adj & board->snakes[r].head)) {
           // tie breaker: prefer a probable head-to-head death to certain death
-          *evalp += 16;
+          tiebreak += +16;
           goto update;
         }
 
-    board->bodies |= snake->head;
     snake->health--;
-    if (snake->taillag)
-      snake->taillag--;
+    snake->body |= snake->head;
+    snake->taillag && snake->taillag--;
     if (snake->head & board->food) {
       snake->length++, snake->taillag++, snake->health = 100;
       board->food &= ~snake->head;
@@ -259,17 +281,17 @@ struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
 
     // `+2` because the least significant bit of evals is used as a mark.
     // tie breaker: even when certain death is coming, survive as long as we can
-    int tiebreak = +2;
+    tiebreak += +2;
     // tie breaker: certain death is better if it's contingent on an opponent
     tiebreak += s ? +2 : 0;
 
     did_recurse = true;
-    // clang-format off
     *evalp = step(s, cutoff, abort, board, evals + 1, alpha - tiebreak,
-                  beta - tiebreak, depth - 1).eval + tiebreak;
-    // clang-format on
+                  beta - tiebreak, depth - 1)
+                 .eval;
 
   update:
+    *evalp += tiebreak;
     if (s && *evalp < best.eval) {
       best.eval = *evalp, best.move = evalp - *evals;
       beta = best.eval < beta ? best.eval : beta;
@@ -284,9 +306,9 @@ struct best step(int s, clock_t cutoff, jmp_buf abort, struct board *board,
 
     if (snake->length > length)
       board->food |= snake->head;
+    snake->body &= ~snake->head;
     snake->length = length, snake->health = health;
     snake->taillag = taillag;
-    board->bodies &= ~snake->head;
 
   contin:
     sign ? (snake->head >>= axis ? board->width : 1)
@@ -339,7 +361,7 @@ struct best turn(clock_t cutoff, jmp_buf abort, struct board *board,
       continue;
 
     // move the tail toward the head according to `snake.axis` and `snake.sign`
-    board->bodies &= ~snake->tail;
+    snake->body &= ~snake->tail;
     axes <<= 1, sgns <<= 1;
     axes |= !!(snake->axis & snake->tail);
     sgns |= !!(snake->sign & snake->tail);
@@ -362,7 +384,7 @@ struct best turn(clock_t cutoff, jmp_buf abort, struct board *board,
     axes & 1 ? (snake->axis |= snake->tail) : (snake->axis &= ~snake->tail);
     sgns & 1 ? (snake->sign |= snake->tail) : (snake->sign &= ~snake->tail);
     axes >>= 1, sgns >>= 1;
-    board->bodies |= snake->tail;
+    snake->body |= snake->tail;
   }
 
   board->heads = 0;
@@ -458,8 +480,7 @@ int main(void) {
         fputs("bad body point\n", stderr), exit(EXIT_FAILURE);
 
       seed <<= 1, seed ^= x ^ y;
-      signed char dx = tx - x, dy = ty - y;
-      bool axis = dy != 0, sign = dx > 0 || dy > 0;
+      bool axis = ty - y != 0, sign = tx - x + ty - y > 0;
 
       if (hx == -1 && hy == -1)
         hx = x, hy = y;
@@ -471,9 +492,9 @@ int main(void) {
       tx = x, ty = y;
 
       // store the path toward the head in `snake.axis` and `snake.sign`
+      snake->body |= (bb_t)1 << x + y * board.width;
       snake->axis |= (bb_t)axis << x + y * board.width;
       snake->sign |= (bb_t)sign << x + y * board.width;
-      board.bodies |= (bb_t)1 << x + y * board.width;
     }
 
     snake->head = (bb_t)1 << hx + hy * board.width;
