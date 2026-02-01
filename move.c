@@ -524,9 +524,12 @@ int main(void) {
 
   // iterative deepening: iteratively search deeper and deeper until we hit
   // `SEARCH_TIME`, caching move evals as we go along so we can prune more
-  // branches in subsequent iterations. it's important to realize that with
-  // alpha--beta pruning, cached evals are lower/upper bounds on the real
-  // evals, so they can't be used to deduce the final `best.move`
+  // branches in subsequent iterations. we cache per depth and not per node;
+  // per-node needs megabytes of cache before reaching the the efficiency
+  // of per-depth as measured by number of evals per search, and by then
+  // performance has long been decimated by CPU cache misses. also keep in
+  // mind that with alpha--beta pruning, cached evals are lower/upper bounds
+  // on the real evals, so they can't be used to deduce the final `best.move`
 
   clock_t start = clock(), prev = start;
   fprintf(stderr, "\nDEPTH\tMICROS\tTOTAL\tEVALS\tEVALS/S\n");
