@@ -394,7 +394,7 @@ struct best turn(clock_t cutoff, jmp_buf abort, struct board *board,
 
 int main(void) {
   static char req[1 << 16];
-  size_t size = fread(req, 1, sizeof(req) - 1, stdin);
+  size_t size = fread(req, 1, sizeof req - 1, stdin);
   if (ferror(stdin))
     perror("fread"), exit(EXIT_FAILURE);
   if (!feof(stdin))
@@ -505,8 +505,8 @@ int main(void) {
 
   time_t t = time(NULL);
   struct tm *tm = localtime(&t);
-  char buf[sizeof("1999-12-31T23:59:59+0000")]; // ISO 8601
-  if (strftime(buf, sizeof(buf), "%FT%T%z", tm) == 0)
+  char buf[sizeof "1999-12-31T23:59:59+0000"]; // ISO 8601
+  if (strftime(buf, sizeof buf, "%FT%T%z", tm) == 0)
     abort();
   fprintf(stderr, "\n%s\n", buf);
 
@@ -546,7 +546,7 @@ int main(void) {
     clock_t cutoff = move == prev_move ? start + CLOCKS_PER_SEC * TOTAL_TIME
                                        : start + CLOCKS_PER_SEC * SEARCH_TIME;
     move = turn(cutoff, abort, &board, evals, EVAL_MIN, EVAL_MAX, depth).move;
-    memcpy(root_evals, evals, sizeof(root_evals));
+    memcpy(root_evals, evals, sizeof root_evals);
 
     clock_t now = clock();
     fprintf(stderr, "%d\t%06lld\t%06lld\t%7d\t%7lld\n", depth,
@@ -566,7 +566,7 @@ int main(void) {
   // slow down search and give different evals but should never change what
   // the final `best.move` is
   // move = turn(0, (jmp_buf){0}, &board, evals, EVAL_MIN, EVAL_MAX, 20).move;
-  // memcpy(root_evals, *evals, sizeof(root_evals));
+  // memcpy(root_evals, *evals, sizeof root_evals);
 
   char *moves[] = {"left", "right", "down", "up"}; // JSON escaped
 

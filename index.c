@@ -11,10 +11,10 @@ int main(void) {
   printf("Status: 200 OK\nContent-Type: application/json\n\n");
 
   char author[64], color[64], head[64], tail[64];
-  if (*jsonw_escape(author, sizeof(author), AUTHOR) ||
-      *jsonw_escape(color, sizeof(color), COLOR) ||
-      *jsonw_escape(head, sizeof(head), HEAD) ||
-      *jsonw_escape(tail, sizeof(tail), TAIL))
+  if (*jsonw_escape(author, sizeof author, AUTHOR) ||
+      *jsonw_escape(color, sizeof color, COLOR) ||
+      *jsonw_escape(head, sizeof head, HEAD) ||
+      *jsonw_escape(tail, sizeof tail, TAIL))
     abort();
 
   printf("{\"apiversion\":\"1\",\"author\":\"%s\","
