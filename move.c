@@ -146,9 +146,9 @@ short eval(struct board *board) {
     lost |= adj(lost, board) & ~bodies & ~owned;
   }
 
-  // if we own a cell adjacent to a snake's tail, it's probably we could follow
+  // if we own a cell adjacent to a snake's tail, it's probable we could follow
   // that tail for a while, so guess that we own about half that snake's body.
-  // the same goes for lost cells. this metric should be useful in the endgame.
+  // the same goes for lost cells. this metric is pivotal in the endgame.
   int n_owned = bb_popcnt(owned), n_lost = bb_popcnt(lost);
   for (int s = 0; s < MAX_SNAKES; s++) {
     if (!board->snakes[s].health)
